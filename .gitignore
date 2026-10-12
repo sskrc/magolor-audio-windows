@@ -1,0 +1,19 @@
+# build output
+/out/
+/pkg/
+*.obj
+*.pdb
+*.sys
+*.cat
+
+# logs / captures from test runs
+*.log
+trace.bin
+trace.txt
+
+# signing material: never commit
+*.pfx
+*.p12
+*.cer
+*.pvk
+*.snk
