@@ -1,8 +1,10 @@
 # magolor-audio-windows
 
+**日本語** | [English](README.en.md)
+
 Windows で **Acer Chromebook R753T(ボード名 "Magolor"、Intel Jasper Lake)** の内蔵スピーカーを鳴らすための、非公式な自作オーディオドライバです。
 
-> **English summary** — An unofficial, experimental Windows PortCls (WaveRT) driver for the internal speakers of the Jasper Lake Chromebook "Magolor" (Acer R753T) running Windows via MrChromebox UEFI firmware. It boots the cAVS 2.0 audio DSP with Intel's signed Sound Open Firmware (SOF v2.2, IPC3), builds a host → SSP1 pipeline and drives the RT1015P amplifier. Speakers, volume, reboot and Modern Standby resume work. Headphone jack and microphones are not supported. Use at your own risk.
+> **English summary** — An unofficial, experimental Windows PortCls (WaveRT) driver for the internal speakers of the Jasper Lake Chromebook "Magolor" (Acer R753T) running Windows via MrChromebox UEFI firmware. It boots the cAVS 2.0 audio DSP with Intel's signed Sound Open Firmware (SOF v2.2, IPC3), builds a host → SSP1 pipeline and drives the RT1015P amplifier. Speakers, volume, reboot and Modern Standby resume work. Headphone jack and microphones are not supported. Use at your own risk. Full English README: [README.en.md](README.en.md).
 
 ## AI による作成について
 
