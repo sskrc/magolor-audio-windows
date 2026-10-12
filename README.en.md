@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-An unofficial, home-made audio driver that makes the internal speakers of the **Acer Chromebook R753T (board "Magolor", Intel Jasper Lake)** work on Windows.
+An unofficial, home-made audio driver that makes the internal speakers and microphones of the **Acer Chromebook R753T (board "Magolor", Intel Jasper Lake)** work on Windows.
 
 ## About AI authorship
 
@@ -17,7 +17,7 @@ The code has been verified to work on real hardware, but it has **not been exhau
 | Volume control (Windows software volume) | ✅ |
 | Playback after reboot and after sleep (Modern Standby) resume | ✅ |
 | Headphone jack (RT5682) | ❌ not supported |
-| Internal microphones (DMIC) | ❌ not supported |
+| Internal microphones (DMIC, 2 ch, shown as a regular Windows "Microphone" device) | ✅ |
 
 Tested on: Acer Chromebook R753T (Magolor, Celeron N4500), MrChromebox UEFI firmware, Windows 11 Pro (build 26200).
 A slight white noise may be audible during playback (it is silent when nothing is playing).
@@ -59,12 +59,14 @@ Run everything from PowerShell in the repository root.
    ```
    To turn test-signing mode off again, run `bcdedit /set testsigning off`, reboot, and delete the certificate (`CN=JSL Audio Test`) with `certlm.msc` / `certmgr.msc`.
 
-The driver writes its log to `C:\Windows\Temp\jslaudio.log`.
+The driver writes its log to `C:\Windows\Temp\jslaudio.log` (reading it requires Administrator rights). Install with `install.ps1 -LogPath <file>` to write it to a file of your choice instead.
 
 ## How it works
 
-- A PortCls WaveRT miniport (Wave) and a topology miniport expose a "Speakers" endpoint to Windows. The only supported format is 48 kHz / 2 ch / 32-bit PCM; the Windows audio engine converts everything else.
-- When the device starts, the SOF firmware is transferred to the DSP over the HDA code-loader DMA stream and booted, then a `host → buffer → SSP1 DAI` pipeline is built over IPC3 (I2S, 48 kHz, 2 × 32-bit slots, BCLK 3.072 MHz).
+- One PortCls WaveRT miniport (Wave) + topology miniport pair per path exposes "Speakers" and "Microphone" endpoints to Windows. The only supported format is 48 kHz / 2 ch / 32-bit PCM; the Windows audio engine converts everything else.
+- When the device starts, the SOF firmware is transferred to the DSP over the HDA code-loader DMA stream and booted, then these pipelines are built over IPC3:
+  - speaker: `host → buffer → SSP1 DAI` (I2S, 48 kHz, 2 × 32-bit slots, BCLK 3.072 MHz)
+  - microphone: `DMIC0 DAI → buffer → host` (two mics on PDM0, PDM clock 2.4–4.8 MHz, matching the ACPI hint `mic-tplg` = `2ch-pdm0`)
 - On playback start, as in Linux SOF, **the host DMA is started before the IPC trigger** is sent (in the reverse order the DSP underruns almost immediately and stops the pipeline).
 - The RT1015P amplifier's SDB pin is ACPI GpioIo 209. That number is in the pinctrl gpio_base space; the actual pad is **GPP_D17 (community 1, pad 41)**. It is driven high only while playing.
 - On sleep (D3) the DSP is powered down; on resume (D0) it is rebooted and the stream is restored. The firmware ships inside the driver package and is cached in memory at first start.

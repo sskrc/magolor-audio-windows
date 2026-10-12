@@ -2,9 +2,9 @@
 
 **日本語** | [English](README.en.md)
 
-Windows で **Acer Chromebook R753T(ボード名 "Magolor"、Intel Jasper Lake)** の内蔵スピーカーを鳴らすための、非公式な自作オーディオドライバです。
+Windows で **Acer Chromebook R753T(ボード名 "Magolor"、Intel Jasper Lake)** の内蔵スピーカーと内蔵マイクを使うための、非公式な自作オーディオドライバです。
 
-> **English summary** — An unofficial, experimental Windows PortCls (WaveRT) driver for the internal speakers of the Jasper Lake Chromebook "Magolor" (Acer R753T) running Windows via MrChromebox UEFI firmware. It boots the cAVS 2.0 audio DSP with Intel's signed Sound Open Firmware (SOF v2.2, IPC3), builds a host → SSP1 pipeline and drives the RT1015P amplifier. Speakers, volume, reboot and Modern Standby resume work. Headphone jack and microphones are not supported. Use at your own risk. Full English README: [README.en.md](README.en.md).
+> **English summary** — An unofficial, experimental Windows PortCls (WaveRT) driver for the internal speakers and microphones of the Jasper Lake Chromebook "Magolor" (Acer R753T) running Windows via MrChromebox UEFI firmware. It boots the cAVS 2.0 audio DSP with Intel's signed Sound Open Firmware (SOF v2.2, IPC3), builds host → SSP1 (speaker, RT1015P amplifier) and DMIC → host (microphone) pipelines. Speakers, microphones, volume, reboot and Modern Standby resume work. The headphone jack is not supported yet. Use at your own risk. Full English README: [README.en.md](README.en.md).
 
 ## AI による作成について
 
@@ -21,7 +21,7 @@ Windows で **Acer Chromebook R753T(ボード名 "Magolor"、Intel Jasper Lake)*
 | 音量調整(Windows のソフトウェア音量) | ✅ |
 | 再起動後・スリープ(モダンスタンバイ)復帰後の再生 | ✅ |
 | ヘッドホン端子(RT5682) | ❌ 未対応 |
-| 内蔵マイク(DMIC) | ❌ 未対応 |
+| 内蔵マイク(DMIC、2ch、Windows 標準の「マイク」として表示) | ✅ |
 
 動作確認機: Acer Chromebook R753T(Magolor、Celeron N4500)、MrChromebox UEFI ファームウェア、Windows 11 Pro(build 26200)。
 再生中にわずかなホワイトノイズが聞こえることがあります(無音時は聞こえません)。
@@ -63,12 +63,14 @@ Visual Studio は不要です。
    ```
    テスト署名モードを戻すには `bcdedit /set testsigning off` を実行して再起動し、証明書(`CN=JSL Audio Test`)を `certlm.msc` / `certmgr.msc` から削除します。
 
-ドライバのログは `C:\Windows\Temp\jslaudio.log` に出ます。
+ドライバのログは `C:\Windows\Temp\jslaudio.log` に出ます(読むには管理者権限が必要です)。`install.ps1 -LogPath <ファイル>` を付けてインストールすると、指定したファイルに出力します。
 
 ## 仕組み
 
-- PortCls の WaveRT ミニポート(Wave)とトポロジーミニポートで、Windows に「スピーカー」を見せます。対応形式は 48 kHz / 2ch / 32bit PCM のみで、それ以外は Windows のオーディオエンジンが変換します。
-- デバイス起動時に、HDA のコードローダー DMA で SOF ファームウェアを DSP に転送してブートし、IPC3 で `host → buffer → SSP1 DAI` のパイプラインを組みます(I2S、48 kHz、32bit スロット×2、BCLK 3.072 MHz)。
+- PortCls の WaveRT ミニポート(Wave)とトポロジーミニポートの組を経路ごとに用意し、Windows に「スピーカー」と「マイク」を見せます。対応形式は 48 kHz / 2ch / 32bit PCM のみで、それ以外は Windows のオーディオエンジンが変換します。
+- デバイス起動時に、HDA のコードローダー DMA で SOF ファームウェアを DSP に転送してブートし、IPC3 で次のパイプラインを組みます。
+  - スピーカー: `host → buffer → SSP1 DAI`(I2S、48 kHz、32bit スロット×2、BCLK 3.072 MHz)
+  - マイク: `DMIC0 DAI → buffer → host`(PDM0 の2マイク、PDM クロック 2.4〜4.8 MHz。ACPI の `mic-tplg` = `2ch-pdm0` に合わせた構成)
 - 再生開始時は Linux SOF と同じく **ホスト DMA を先に起動してから IPC trigger** を送ります(逆順だと DSP 側がすぐアンダーランして停止します)。
 - アンプ RT1015P の SDB は ACPI の GpioIo 209 です。これは pinctrl の gpio_base 空間の番号で、実際のピンは **GPP_D17(コミュニティ1 パッド41)** です。再生中だけ High にします。
 - スリープ時(D3)は DSP を停止し、復帰時(D0)に再ブートしてストリームを復元します。ファームウェアはドライバパッケージに同梱し、初回起動時にメモリに読み込んで保持します。

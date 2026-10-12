@@ -5,11 +5,13 @@
  *
  * Hardware sequence is the one proven in boot2.c:
  *   - DSP boot via HDA code-loader stream, SOF v2.2 firmware
- *   - static pipeline: host(1) -> buffer(3) -> SSP1 DAI(5), pipeline 1
- *   - per stream: host HDA output stream 8 / tag 2, pcm_params, host DMA RUN *before* IPC trigger
- *   - amp SDB = GPP_D17 (community 1 pad 41) high while running
+ *   - static pipelines (see g_paths):
+ *       speaker: host(1) -> buffer(3) -> SSP1 DAI(5), pipeline 1, HDA output stream 8 / tag 2
+ *       DMIC:    DMIC0 DAI(15) -> buffer(13) -> host(11), pipeline 2, HDA input stream 1 / tag 2
+ *   - per stream: pcm_params, host DMA RUN *before* IPC trigger
+ *   - amp SDB = GPP_D17 (community 1 pad 41) high while the speaker runs
  * Only 48 kHz / 2 ch / 32-bit PCM is exposed; the Windows audio engine converts.
- * Everything is polled; no interrupts. Log: %SystemRoot%\Temp\jslaudio.log
+ * Everything is polled; no interrupts. Log: %SystemRoot%\Temp\jslaudio.log (or service value LogPath)
  */
 #define _NEW_DELETE_OPERATORS_
 #include <initguid.h>
@@ -119,11 +121,34 @@ static VOID Log(const char *fmt, ...)
     ZwWriteFile(g_log, NULL, NULL, NULL, &iosb, buf, (ULONG)len, NULL, NULL);
 }
 
+/* optional REG_SZ "LogPath" (NT path, e.g. \??\D:\jslaudio.log) under the service key overrides LOG_PATH;
+   read on every open attempt so it can be set after the driver is loaded (scripts\install.ps1 -LogPath) */
+static WCHAR g_regPath[300];
+
+static BOOLEAN RegReadString(PCWSTR value, PWCHAR out, ULONG cbOut)
+{
+    OBJECT_ATTRIBUTES oa; HANDLE k; UNICODE_STRING kn, vn; ULONG len = 0; BOOLEAN ok = FALSE;
+    UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 700];
+    PKEY_VALUE_PARTIAL_INFORMATION kv = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+    if (!g_regPath[0]) return FALSE;
+    RtlInitUnicodeString(&kn, g_regPath);
+    InitializeObjectAttributes(&oa, &kn, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (!NT_SUCCESS(ZwOpenKey(&k, KEY_READ, &oa))) return FALSE;
+    RtlInitUnicodeString(&vn, value);
+    RtlZeroMemory(buf, sizeof(buf));
+    if (NT_SUCCESS(ZwQueryValueKey(k, &vn, KeyValuePartialInformation, kv, sizeof(buf) - 2, &len)) &&
+        (kv->Type == REG_SZ || kv->Type == REG_EXPAND_SZ) && kv->DataLength >= 4)
+        ok = NT_SUCCESS(RtlStringCbCopyNW(out, cbOut, (PCWSTR)kv->Data, kv->DataLength));
+    ZwClose(k);
+    return ok;
+}
+
 static VOID LogOpen(VOID)
 {
-    UNICODE_STRING n; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb;
+    UNICODE_STRING n; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb; WCHAR path[300];
     if (g_log) return;
-    RtlInitUnicodeString(&n, LOG_PATH);
+    if (!RegReadString(L"LogPath", path, sizeof(path))) RtlStringCbCopyW(path, sizeof(path), LOG_PATH);
+    RtlInitUnicodeString(&n, path);
     InitializeObjectAttributes(&oa, &n, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
     if (!NT_SUCCESS(ZwCreateFile(&g_log, FILE_APPEND_DATA | SYNCHRONIZE, &oa, &iosb, NULL,
         FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN_IF,
@@ -295,9 +320,33 @@ static VOID StreamClear(ULONG idx)
 #define COMP_BUFFER 12
 #define FRAME_S24_4LE 1
 #define FRAME_S32_LE  2
-#define DAI_SSP 1
-#define DAI_IDX 1
-#define HOST_COMP_ID 1
+#define DAI_SSP  1
+#define DAI_DMIC 2
+#define DIR_PLAYBACK 0
+#define DIR_CAPTURE  1
+
+/* One audio path = one static SOF pipeline + one HDA host stream + one Windows endpoint.
+   Component ids: host = base+1, buffer = base+3, dai = base+5, pipeline (sched) comp = base+6. */
+typedef struct {
+    const char *name;
+    ULONG   dir;          /* DIR_PLAYBACK / DIR_CAPTURE */
+    ULONG   base;         /* component id base, also used as pipeline id / 10 */
+    ULONG   daiType, daiIndex, daiFrameFmt;
+    ULONG   tag;          /* HDA stream tag (per direction) */
+    BOOLEAN amp;          /* drive the RT1015P SDB while running */
+    ULONG   hdaIdx;       /* HDA stream descriptor index, set at HwStart */
+    BOOLEAN ready;        /* pipeline built in the current DSP boot */
+} AUDIOPATH;
+
+enum { PATH_SPK = 0, PATH_DMIC = 1, NPATHS };
+static AUDIOPATH g_paths[NPATHS] = {
+    { "speaker", DIR_PLAYBACK,  0, DAI_SSP,  1, FRAME_S24_4LE, 2, TRUE  },
+    { "dmic",    DIR_CAPTURE,  10, DAI_DMIC, 0, FRAME_S32_LE,  2, FALSE },
+};
+#define HOST_ID(p) ((p)->base + 1)
+#define BUF_ID(p)  ((p)->base + 3)
+#define DAI_ID(p)  ((p)->base + 5)
+#define PIPE_ID(p) ((p)->base + 6)
 
 #pragma pack(push, 1)
 typedef struct { ULONG size, cmd; } CMDHDR;
@@ -310,13 +359,27 @@ typedef struct { CMDHDR hdr; ULONG comp_id, pipeline_id, sched_id, core, period,
 typedef struct { CMDHDR hdr; ULONG comp_id; } IPC_PIPE_READY;
 typedef struct { CMDHDR hdr; ULONG source_id, sink_id; } IPC_CONNECT;
 typedef struct {
-    CMDHDR hdr; ULONG type, dai_index; USHORT format; UCHAR group_id, flags; ULONG reserved[8];
     ULONG s_reserved0; USHORT s_reserved1, mclk_id; ULONG mclk_rate, fsync_rate, bclk_rate;
     ULONG tdm_slots, rx_slots, tx_slots, sample_valid_bits; USHORT tdm_slot_width, s_reserved2;
     ULONG mclk_direction; USHORT frame_pulse_width, tdm_per_slot_padding_flag;
     ULONG clks_control, quirks, bclk_delay;
-    UCHAR pad[216 - 52 - 60];
-} IPC_DAI_CONFIG;
+} SSP_PARAMS;                                   /* sof_ipc_dai_ssp_params, 60 bytes */
+typedef struct {
+    ULONG reserved0; USHORT id, enable_mic_a, enable_mic_b, polarity_mic_a, polarity_mic_b, clk_edge, skew, reserved[3];
+} DMIC_PDM;                                     /* sof_ipc_dai_dmic_pdm_ctrl, 24 bytes */
+typedef struct {
+    ULONG reserved0, driver_ipc_version, pdmclk_min, pdmclk_max, fifo_fs, reserved_1;
+    USHORT fifo_bits, fifo_bits_b, duty_min, duty_max;
+    ULONG num_pdm_active, wake_up_time, min_clock_on_time, unmute_ramp_time, reserved[5];
+    DMIC_PDM pdm[4];
+} DMIC_PARAMS;                                  /* sof_ipc_dai_dmic_params, 164 bytes */
+typedef struct {
+    CMDHDR hdr; ULONG type, dai_index; USHORT format; UCHAR group_id, flags; ULONG reserved[8];
+    union { SSP_PARAMS ssp; DMIC_PARAMS dmic; };
+} IPC_DAI_CONFIG;                               /* sof_ipc_dai_config, 216 bytes (Linux sends the full union) */
+C_ASSERT(sizeof(SSP_PARAMS) == 60);
+C_ASSERT(sizeof(DMIC_PARAMS) == 164);
+C_ASSERT(sizeof(IPC_DAI_CONFIG) == 216);
 typedef struct {
     CMDHDR hdr; ULONG comp_id, flags, reserved[2];
     ULONG p_size;
@@ -358,10 +421,10 @@ static NTSTATUS IpcTx(const char *what, PVOID msg, ULONG size)
     return err ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
 }
 
-static NTSTATUS IpcStream(const char *what, ULONG cmd)
+static NTSTATUS IpcStream(AUDIOPATH *p, const char *what, ULONG cmd)
 {
     IPCMSG m; RtlZeroMemory(&m, sizeof(m));
-    m.s.hdr.size = sizeof(m.s); m.s.hdr.cmd = GLB_STREAM | cmd; m.s.comp_id = HOST_COMP_ID;
+    m.s.hdr.size = sizeof(m.s); m.s.hdr.cmd = GLB_STREAM | cmd; m.s.comp_id = HOST_ID(p);
     return IpcTx(what, &m, sizeof(m.s));
 }
 
@@ -372,56 +435,76 @@ static VOID CompCfg(COMPCFG *c, ULONG sink, ULONG src, ULONG fmt)
     c->periods_sink = sink; c->periods_source = src; c->frame_fmt = fmt;
 }
 
-/* static topology: host(1) -> buffer(3) -> SSP1 DAI(5), pipeline 1 scheduled on comp 6 */
-static NTSTATUS BuildPipeline(VOID)
+/* DAI configuration for each path (values from sof-jsl-rt5682-rt1015.tplg; DMIC as "2ch-pdm0" per ACPI) */
+static VOID FillDaiConfig(AUDIOPATH *p, IPC_DAI_CONFIG *dc)
+{
+    dc->hdr.size = sizeof(*dc); dc->hdr.cmd = GLB_DAI | DAI_CONFIG;
+    dc->type = p->daiType; dc->dai_index = p->daiIndex;
+    dc->flags = 1;                                   /* HW_PARAMS */
+    if (p->daiType == DAI_SSP) {
+        dc->format = 0x0001 | 0x4000;                /* I2S, NB_NF, codec bclk+fsync consumer */
+        dc->ssp.mclk_rate = 19200000; dc->ssp.fsync_rate = 48000; dc->ssp.bclk_rate = 3072000;
+        dc->ssp.tdm_slots = 2; dc->ssp.rx_slots = 3; dc->ssp.tx_slots = 3;
+        dc->ssp.sample_valid_bits = 24; dc->ssp.tdm_slot_width = 32;
+        dc->ssp.clks_control = (1u << 6) | (1u << 7);   /* MCLK/BCLK early start: RT1015P locks before data */
+    } else {
+        dc->format = 6;                              /* SOF_DAI_FMT_PDM */
+        dc->dmic.driver_ipc_version = 1;
+        dc->dmic.pdmclk_min = 2400000; dc->dmic.pdmclk_max = 4800000;
+        dc->dmic.duty_min = 40; dc->dmic.duty_max = 60;
+        dc->dmic.fifo_fs = 48000; dc->dmic.fifo_bits = 32;
+        dc->dmic.unmute_ramp_time = 200;
+        dc->dmic.num_pdm_active = 1;
+        dc->dmic.pdm[0].id = 0; dc->dmic.pdm[0].enable_mic_a = 1; dc->dmic.pdm[0].enable_mic_b = 1;
+    }
+}
+
+/* static topology per path. playback: host -> buffer -> dai (scheduled on the dai)
+                            capture:  dai  -> buffer -> host (scheduled on the dai) */
+static NTSTATUS BuildPipeline(AUDIOPATH *p)
 {
     IPCMSG m; NTSTATUS st;
+    BOOLEAN cap = (p->dir == DIR_CAPTURE);
 
     RtlZeroMemory(&m, sizeof(m));
     m.pn.hdr.size = sizeof(m.pn); m.pn.hdr.cmd = GLB_TPLG | TPLG_PIPE_NEW;
-    m.pn.comp_id = 6; m.pn.pipeline_id = 1; m.pn.sched_id = 5; m.pn.core = 0;
+    m.pn.comp_id = PIPE_ID(p); m.pn.pipeline_id = p->base / 10 + 1; m.pn.sched_id = DAI_ID(p); m.pn.core = 0;
     m.pn.period = 1000; m.pn.priority = 0; m.pn.period_mips = 5000; m.pn.time_domain = 1;
     if (!NT_SUCCESS(st = IpcTx("pipe_new", &m, sizeof(m.pn)))) return st;
 
     RtlZeroMemory(&m, sizeof(m));
     m.h.comp.hdr.size = sizeof(m.h); m.h.comp.hdr.cmd = GLB_TPLG | TPLG_COMP_NEW;
-    m.h.comp.id = HOST_COMP_ID; m.h.comp.type = COMP_HOST; m.h.comp.pipeline_id = 1;
-    CompCfg(&m.h.config, 2, 0, FRAME_S32_LE);
+    m.h.comp.id = HOST_ID(p); m.h.comp.type = COMP_HOST; m.h.comp.pipeline_id = p->base / 10 + 1;
+    CompCfg(&m.h.config, cap ? 0 : 2, cap ? 2 : 0, FRAME_S32_LE);
+    m.h.direction = p->dir;
     if (!NT_SUCCESS(st = IpcTx("host", &m, sizeof(m.h)))) return st;
 
     RtlZeroMemory(&m, sizeof(m));
     m.b.comp.hdr.size = sizeof(m.b); m.b.comp.hdr.cmd = GLB_TPLG | TPLG_BUFFER_NEW;
-    m.b.comp.id = 3; m.b.comp.type = COMP_BUFFER; m.b.comp.pipeline_id = 1;
+    m.b.comp.id = BUF_ID(p); m.b.comp.type = COMP_BUFFER; m.b.comp.pipeline_id = p->base / 10 + 1;
     m.b.size = 3072; m.b.caps = 0x31;
     if (!NT_SUCCESS(st = IpcTx("buffer", &m, sizeof(m.b)))) return st;
 
     RtlZeroMemory(&m, sizeof(m));
     m.d.comp.hdr.size = sizeof(m.d); m.d.comp.hdr.cmd = GLB_TPLG | TPLG_COMP_NEW;
-    m.d.comp.id = 5; m.d.comp.type = COMP_DAI; m.d.comp.pipeline_id = 1;
-    CompCfg(&m.d.config, 0, 2, FRAME_S24_4LE);
-    m.d.dai_index = DAI_IDX; m.d.type = DAI_SSP;
+    m.d.comp.id = DAI_ID(p); m.d.comp.type = COMP_DAI; m.d.comp.pipeline_id = p->base / 10 + 1;
+    CompCfg(&m.d.config, cap ? 2 : 0, cap ? 0 : 2, p->daiFrameFmt);
+    m.d.direction = p->dir; m.d.dai_index = p->daiIndex; m.d.type = p->daiType;
     if (!NT_SUCCESS(st = IpcTx("dai", &m, sizeof(m.d)))) return st;
 
     RtlZeroMemory(&m, sizeof(m));
     m.c.hdr.size = sizeof(m.c); m.c.hdr.cmd = GLB_TPLG | TPLG_COMP_CONNECT;
-    m.c.source_id = 1; m.c.sink_id = 3;
-    if (!NT_SUCCESS(st = IpcTx("connect host->buf", &m, sizeof(m.c)))) return st;
-    m.c.source_id = 3; m.c.sink_id = 5;
-    if (!NT_SUCCESS(st = IpcTx("connect buf->dai", &m, sizeof(m.c)))) return st;
+    m.c.source_id = cap ? DAI_ID(p) : HOST_ID(p); m.c.sink_id = BUF_ID(p);
+    if (!NT_SUCCESS(st = IpcTx("connect 1", &m, sizeof(m.c)))) return st;
+    m.c.source_id = BUF_ID(p); m.c.sink_id = cap ? HOST_ID(p) : DAI_ID(p);
+    if (!NT_SUCCESS(st = IpcTx("connect 2", &m, sizeof(m.c)))) return st;
 
     RtlZeroMemory(&m, sizeof(m));
-    m.dc.hdr.size = sizeof(m.dc); m.dc.hdr.cmd = GLB_DAI | DAI_CONFIG;
-    m.dc.type = DAI_SSP; m.dc.dai_index = DAI_IDX;
-    m.dc.format = 0x0001 | 0x4000;           /* I2S, NB_NF, codec bclk+fsync consumer */
-    m.dc.flags = 1;                          /* HW_PARAMS */
-    m.dc.mclk_rate = 19200000; m.dc.fsync_rate = 48000; m.dc.bclk_rate = 3072000;
-    m.dc.tdm_slots = 2; m.dc.rx_slots = 3; m.dc.tx_slots = 3;
-    m.dc.sample_valid_bits = 24; m.dc.tdm_slot_width = 32;
-    m.dc.clks_control = (1u << 6) | (1u << 7);   /* MCLK/BCLK early start: RT1015P locks before data */
+    FillDaiConfig(p, &m.dc);
     if (!NT_SUCCESS(st = IpcTx("dai_config", &m, sizeof(m.dc)))) return st;
 
     RtlZeroMemory(&m, sizeof(m));
-    m.pr.hdr.size = sizeof(m.pr); m.pr.hdr.cmd = GLB_TPLG | TPLG_PIPE_COMPLETE; m.pr.comp_id = 6;
+    m.pr.hdr.size = sizeof(m.pr); m.pr.hdr.cmd = GLB_TPLG | TPLG_PIPE_COMPLETE; m.pr.comp_id = PIPE_ID(p);
     return IpcTx("pipe_complete", &m, sizeof(m.pr));
 }
 
@@ -649,13 +732,24 @@ static NTSTATUS HwStart(VOID)
         Log("powered down leftover DSP cores: ADSPCS=%08X", R32(g_dsp, DSP_ADSPCS));
     }
 
+    g_paths[PATH_SPK].hdaIdx  = g_iss + 1;      /* 2nd output stream (1st is the code loader) */
+    g_paths[PATH_DMIC].hdaIdx = 1;              /* 2nd input stream (1st is used by the boot ICCMAX stream) */
+    for (t = 0; t < NPATHS; t++) g_paths[t].ready = FALSE;
+
     st = BootDsp();
     Log("BootDsp -> %08X", st);
     if (!NT_SUCCESS(st)) return st;
-    st = BuildPipeline();
-    Log("BuildPipeline -> %08X", st);
-    if (NT_SUCCESS(st)) g_dspReady = TRUE;
-    return st;
+    st = BuildPipeline(&g_paths[PATH_SPK]);     /* the speaker is mandatory ... */
+    Log("BuildPipeline speaker -> %08X", st);
+    if (!NT_SUCCESS(st)) return st;
+    g_paths[PATH_SPK].ready = TRUE;
+    for (t = PATH_SPK + 1; t < NPATHS; t++) {   /* ... the other paths are optional */
+        NTSTATUS ps = BuildPipeline(&g_paths[t]);
+        g_paths[t].ready = NT_SUCCESS(ps);
+        Log("BuildPipeline %s -> %08X", g_paths[t].name, ps);
+    }
+    g_dspReady = TRUE;
+    return STATUS_SUCCESS;
 }
 
 /* ------------------------------------------------------------------ formats / descriptors */
@@ -696,6 +790,23 @@ static PCFILTER_DESCRIPTOR g_topoFilter = {
     0, NULL, sizeof(PCPIN_DESCRIPTOR), 2, g_topoPins, sizeof(PCNODE_DESCRIPTOR), 0, NULL, 1, g_topoConn, 0, NULL
 };
 
+/* capture (internal DMIC): topology  mic pin 0 (in) -> bridge pin 1 (out)  ==>  wave bridge pin 0 (in) -> streaming pin 1 (out) */
+static PCPIN_DESCRIPTOR g_waveCapPins[] = {
+    { 0, 0, 0, NULL, { 0, NULL, 0, NULL, 1, g_bridgeRanges, KSPIN_DATAFLOW_IN, KSPIN_COMMUNICATION_NONE, &KSCATEGORY_AUDIO, NULL, 0 } },
+    { 1, 1, 0, NULL, { 0, NULL, 0, NULL, 1, g_pinRanges, KSPIN_DATAFLOW_OUT, KSPIN_COMMUNICATION_SINK, &KSCATEGORY_AUDIO, NULL, 0 } },
+};
+static PCFILTER_DESCRIPTOR g_waveCapFilter = {
+    0, NULL, sizeof(PCPIN_DESCRIPTOR), 2, g_waveCapPins, sizeof(PCNODE_DESCRIPTOR), 0, NULL, 1, g_topoConn, 0, NULL
+};
+static PCPIN_DESCRIPTOR g_topoMicPins[] = {
+    { 0, 0, 0, NULL, { 0, NULL, 0, NULL, 1, g_bridgeRanges, KSPIN_DATAFLOW_IN, KSPIN_COMMUNICATION_NONE, &KSNODETYPE_MICROPHONE, NULL, 0 } },
+    { 0, 0, 0, NULL, { 0, NULL, 0, NULL, 1, g_bridgeRanges, KSPIN_DATAFLOW_OUT, KSPIN_COMMUNICATION_NONE, &KSCATEGORY_AUDIO, NULL, 0 } },
+};
+static PCFILTER_DESCRIPTOR g_topoMicFilter = {
+    0, NULL, sizeof(PCPIN_DESCRIPTOR), 2, g_topoMicPins, sizeof(PCNODE_DESCRIPTOR), 0, NULL, 1, g_topoConn, 0, NULL
+};
+#define STREAM_PIN(path) (g_paths[path].dir == DIR_CAPTURE ? 1u : 0u)
+
 static BOOLEAN FormatSupported(PKSDATAFORMAT f)
 {
     if (!IsEqualGUIDAligned(f->MajorFormat, KSDATAFORMAT_TYPE_AUDIO) ||
@@ -720,11 +831,18 @@ public:
     ~CStream();
     IMP_IMiniportWaveRTStream;
 
-    NTSTATUS Init(PPORTWAVERTSTREAM port) { m_port = port; m_port->AddRef(); return DmaAlloc(&m_bdl, 4096) ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES; }
+    NTSTATUS Init(PPORTWAVERTSTREAM port, ULONG path)
+    {
+        m_path = &g_paths[path]; m_pathIdx = path;
+        m_port = port; m_port->AddRef();
+        return DmaAlloc(&m_bdl, 4096) ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
+    }
     VOID     PowerDown();          /* g_ipcLock held: DSP is about to lose power */
     VOID     PowerUp();            /* g_ipcLock held: DSP freshly rebooted, replay m_state */
 
 private:
+    AUDIOPATH *m_path;
+    ULONG    m_pathIdx;
     PPORTWAVERTSTREAM m_port;
     PMDL     m_mdl;
     ULONG    m_size;
@@ -737,9 +855,7 @@ private:
     NTSTATUS Start();
 };
 
-static ULONG g_streamIdx;   /* host output stream index (first output + 1, as in boot2) */
-static CStream *g_active;   /* the single render stream (pin max instances = 1), under g_ipcLock */
-#define HOST_TAG 2
+static CStream *g_active[NPATHS];   /* one stream per path (pin max instances = 1), under g_ipcLock */
 
 static VOID IpcLock(VOID)   { KeWaitForSingleObject(&g_ipcLock, Executive, KernelMode, FALSE, NULL); }
 static VOID IpcUnlock(VOID) { KeReleaseMutex(&g_ipcLock, FALSE); }
@@ -757,13 +873,13 @@ VOID CStream::Teardown()
 {
     IpcLock();
     if (m_started && g_dspReady) {           /* Linux STOP: IPC first, then host DMA */
-        IpcStream("trigger stop", STREAM_TRIG_STOP);
-        StreamStop(g_streamIdx);
-        AmpEnable(FALSE);
+        IpcStream(m_path, "trigger stop", STREAM_TRIG_STOP);
+        StreamStop(m_path->hdaIdx);
+        if (m_path->amp) AmpEnable(FALSE);
     }
     if (m_prepared && g_dspReady) {
-        IpcStream("pcm_free", STREAM_PCM_FREE);
-        StreamClear(g_streamIdx);
+        IpcStream(m_path, "pcm_free", STREAM_PCM_FREE);
+        StreamClear(m_path->hdaIdx);
     }
     m_started = m_paused = m_prepared = FALSE;
     IpcUnlock();
@@ -772,7 +888,7 @@ VOID CStream::Teardown()
 CStream::~CStream()
 {
     Teardown();
-    IpcLock(); if (g_active == this) g_active = NULL; IpcUnlock();
+    IpcLock(); if (m_path && g_active[m_pathIdx] == this) g_active[m_pathIdx] = NULL; IpcUnlock();
     DmaFree(&m_bdl);
     if (m_port) m_port->Release();
 }
@@ -782,18 +898,19 @@ NTSTATUS CStream::Prepare()
 {
     IPCMSG m; NTSTATUS st;
     if (m_prepared || !m_mdl) return STATUS_SUCCESS;
-    if (!StreamSetup(g_streamIdx, HOST_TAG, &m_bdl, m_pa, m_size, HOST_STREAM_FMT)) return STATUS_UNSUCCESSFUL;
+    if (!m_path->ready) return STATUS_DEVICE_NOT_READY;
+    if (!StreamSetup(m_path->hdaIdx, m_path->tag, &m_bdl, m_pa, m_size, HOST_STREAM_FMT)) return STATUS_UNSUCCESSFUL;
     RtlZeroMemory(&m, sizeof(m));
     m.pp.hdr.size = sizeof(m.pp); m.pp.hdr.cmd = GLB_STREAM | STREAM_PCM_PARAMS;
-    m.pp.comp_id = HOST_COMP_ID;
+    m.pp.comp_id = HOST_ID(m_path);
     m.pp.p_size = 84;
     m.pp.b_size = 28; m.pp.phy_addr = (ULONG)m_pa; m.pp.pages = (m_size + PAGE_SIZE - 1) / PAGE_SIZE; m.pp.b_bytes = m_size;
-    m.pp.direction = 0; m.pp.frame_fmt = FRAME_S32_LE; m.pp.rate = RATE;
-    m.pp.stream_tag = HOST_TAG; m.pp.channels = CHANNELS; m.pp.sample_valid_bytes = 4; m.pp.sample_container_bytes = 4;
+    m.pp.direction = m_path->dir; m.pp.frame_fmt = FRAME_S32_LE; m.pp.rate = RATE;
+    m.pp.stream_tag = (USHORT)m_path->tag; m.pp.channels = CHANNELS; m.pp.sample_valid_bytes = 4; m.pp.sample_container_bytes = 4;
     m.pp.host_period_bytes = m_size / 2; m.pp.no_stream_position = 1;
     m.pp.chmap[0] = 0; m.pp.chmap[1] = 1;
     st = IpcTx("pcm_params", &m, sizeof(m.pp));
-    if (!NT_SUCCESS(st)) { StreamClear(g_streamIdx); return st; }
+    if (!NT_SUCCESS(st)) { StreamClear(m_path->hdaIdx); return st; }
     m_prepared = TRUE;
     return STATUS_SUCCESS;
 }
@@ -803,18 +920,18 @@ NTSTATUS CStream::Start()
 {
     NTSTATUS st;
     if (!m_prepared || (m_started && !m_paused)) return STATUS_SUCCESS;
-    AmpEnable(TRUE);
-    StreamStart(g_streamIdx);
-    st = IpcStream(m_started ? "trigger release" : "trigger start", m_started ? STREAM_TRIG_RELEASE : STREAM_TRIG_START);
+    if (m_path->amp) AmpEnable(TRUE);
+    StreamStart(m_path->hdaIdx);
+    st = IpcStream(m_path, m_started ? "trigger release" : "trigger start", m_started ? STREAM_TRIG_RELEASE : STREAM_TRIG_START);
     if (NT_SUCCESS(st)) { m_started = TRUE; m_paused = FALSE; }
-    else { StreamStop(g_streamIdx); AmpEnable(FALSE); }
+    else { StreamStop(m_path->hdaIdx); if (m_path->amp) AmpEnable(FALSE); }
     return st;
 }
 
 VOID CStream::PowerDown()
 {
-    if (m_started && !m_paused) StreamStop(g_streamIdx);   /* stop bus mastering; DSP state is lost anyway */
-    AmpEnable(FALSE);
+    if (m_started && !m_paused) StreamStop(m_path->hdaIdx);   /* stop bus mastering; DSP state is lost anyway */
+    if (m_path->amp) AmpEnable(FALSE);
     m_started = m_paused = m_prepared = FALSE;
 }
 
@@ -865,7 +982,7 @@ STDMETHODIMP_(NTSTATUS) CStream::GetClockRegister(KSRTAUDIO_HWREGISTER *) { retu
 
 STDMETHODIMP_(NTSTATUS) CStream::GetPosition(PKSAUDIO_POSITION pos)
 {
-    ULONG lpib = (m_prepared && g_dspReady && g_hda) ? R32(g_hda, HDA_SD(g_streamIdx) + SD_LPIB) : 0;
+    ULONG lpib = (m_prepared && g_dspReady && g_hda) ? R32(g_hda, HDA_SD(m_path->hdaIdx) + SD_LPIB) : 0;
     if (m_size && lpib >= m_size) lpib %= m_size;
     pos->PlayOffset = lpib;
     pos->WriteOffset = lpib;
@@ -888,8 +1005,8 @@ STDMETHODIMP_(NTSTATUS) CStream::SetState(KSSTATE s)
     st = Prepare();
     if (NT_SUCCESS(st) && s == KSSTATE_RUN) st = Start();
     else if (NT_SUCCESS(st) && s == KSSTATE_PAUSE && m_started && !m_paused) {
-        st = IpcStream("trigger pause", STREAM_TRIG_PAUSE);   /* PAUSE_PUSH: IPC first, then DMA */
-        StreamStop(g_streamIdx);
+        st = IpcStream(m_path, "trigger pause", STREAM_TRIG_PAUSE);   /* PAUSE_PUSH: IPC first, then DMA */
+        StreamStop(m_path->hdaIdx);
         m_paused = TRUE;
     }
     if (NT_SUCCESS(st)) m_state = s;
@@ -907,9 +1024,9 @@ public:
     DEFINE_STD_CONSTRUCTOR(CMiniportWave);
     ~CMiniportWave() { if (m_port) m_port->Release(); }
     IMP_IMiniportWaveRT;
+    ULONG m_pathIdx;               /* which AUDIOPATH this filter exposes */
 private:
     PPORTWAVERT m_port;
-    LONG m_streams;
 };
 
 STDMETHODIMP CMiniportWave::NonDelegatingQueryInterface(REFIID riid, PVOID *obj)
@@ -928,11 +1045,15 @@ STDMETHODIMP_(NTSTATUS) CMiniportWave::Init(PUNKNOWN, PRESOURCELIST, PPORTWAVERT
     return STATUS_SUCCESS;
 }
 
-STDMETHODIMP_(NTSTATUS) CMiniportWave::GetDescription(PPCFILTER_DESCRIPTOR *d) { *d = &g_waveFilter; return STATUS_SUCCESS; }
+STDMETHODIMP_(NTSTATUS) CMiniportWave::GetDescription(PPCFILTER_DESCRIPTOR *d)
+{
+    *d = (g_paths[m_pathIdx].dir == DIR_CAPTURE) ? &g_waveCapFilter : &g_waveFilter;
+    return STATUS_SUCCESS;
+}
 
 STDMETHODIMP_(NTSTATUS) CMiniportWave::DataRangeIntersection(ULONG pin, PKSDATARANGE range, PKSDATARANGE, ULONG outLen, PVOID result, PULONG resultLen)
 {
-    if (pin != 0) return STATUS_NOT_IMPLEMENTED;
+    if (pin != STREAM_PIN(m_pathIdx)) return STATUS_NOT_IMPLEMENTED;
     if (!IsEqualGUIDAligned(range->MajorFormat, KSDATAFORMAT_TYPE_AUDIO) && !IsEqualGUIDAligned(range->MajorFormat, KSDATAFORMAT_TYPE_WILDCARD))
         return STATUS_NO_MATCH;
     if (range->FormatSize >= sizeof(KSDATARANGE_AUDIO) && IsEqualGUIDAligned(range->Specifier, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)) {
@@ -977,17 +1098,18 @@ STDMETHODIMP_(NTSTATUS) CMiniportWave::GetDeviceDescription(PDEVICE_DESCRIPTION 
 
 STDMETHODIMP_(NTSTATUS) CMiniportWave::NewStream(PMINIPORTWAVERTSTREAM *out, PPORTWAVERTSTREAM portStream, ULONG pin, BOOLEAN capture, PKSDATAFORMAT fmt)
 {
-    if (pin != 0 || capture) return STATUS_INVALID_PARAMETER;
-    if (!FormatSupported(fmt)) { Log("NewStream: unsupported format"); return STATUS_INVALID_PARAMETER; }
-    if (!g_dspReady) return STATUS_DEVICE_NOT_READY;
+    AUDIOPATH *p = &g_paths[m_pathIdx];
+    if (pin != STREAM_PIN(m_pathIdx) || capture != (p->dir == DIR_CAPTURE)) return STATUS_INVALID_PARAMETER;
+    if (!FormatSupported(fmt)) { Log("NewStream %s: unsupported format", p->name); return STATUS_INVALID_PARAMETER; }
+    if (!g_dspReady || !p->ready) return STATUS_DEVICE_NOT_READY;
     CStream *s = new (POOL_FLAG_NON_PAGED, TAG) CStream(NULL);
     if (!s) return STATUS_INSUFFICIENT_RESOURCES;      /* ExAllocatePool2 zero-fills, so members start at 0 */
     s->AddRef();
-    NTSTATUS st = s->Init(portStream);
+    NTSTATUS st = s->Init(portStream, m_pathIdx);
     if (!NT_SUCCESS(st)) { s->Release(); return st; }
     *out = PMINIPORTWAVERTSTREAM(s);
-    IpcLock(); g_active = s; IpcUnlock();
-    Log("NewStream ok");
+    IpcLock(); g_active[m_pathIdx] = s; IpcUnlock();
+    Log("NewStream %s ok", p->name);
     return STATUS_SUCCESS;
 }
 
@@ -998,6 +1120,7 @@ public:
     DECLARE_STD_UNKNOWN();
     DEFINE_STD_CONSTRUCTOR(CMiniportTopo);
     IMP_IMiniportTopology;
+    ULONG m_pathIdx;
 };
 
 STDMETHODIMP CMiniportTopo::NonDelegatingQueryInterface(REFIID riid, PVOID *obj)
@@ -1010,7 +1133,11 @@ STDMETHODIMP CMiniportTopo::NonDelegatingQueryInterface(REFIID riid, PVOID *obj)
     return STATUS_SUCCESS;
 }
 STDMETHODIMP_(NTSTATUS) CMiniportTopo::Init(PUNKNOWN, PRESOURCELIST, PPORTTOPOLOGY) { return STATUS_SUCCESS; }
-STDMETHODIMP_(NTSTATUS) CMiniportTopo::GetDescription(PPCFILTER_DESCRIPTOR *d) { *d = &g_topoFilter; return STATUS_SUCCESS; }
+STDMETHODIMP_(NTSTATUS) CMiniportTopo::GetDescription(PPCFILTER_DESCRIPTOR *d)
+{
+    *d = (g_paths[m_pathIdx].dir == DIR_CAPTURE) ? &g_topoMicFilter : &g_topoFilter;
+    return STATUS_SUCCESS;
+}
 STDMETHODIMP_(NTSTATUS) CMiniportTopo::DataRangeIntersection(ULONG, PKSDATARANGE, PKSDATARANGE, ULONG, PVOID, PULONG) { return STATUS_NOT_IMPLEMENTED; }
 
 /* ------------------------------------------------------------------ power management */
@@ -1042,9 +1169,10 @@ STDMETHODIMP_(void) CAdapterPower::PowerChangeState(POWER_STATE ns)
     if (d == PowerDeviceD0) {
         g_resumeStatus = HwStart();
         g_resumeCount++;
-        if (NT_SUCCESS(g_resumeStatus) && g_active) g_active->PowerUp();
+        if (NT_SUCCESS(g_resumeStatus))
+            for (ULONG i = 0; i < NPATHS; i++) if (g_active[i]) g_active[i]->PowerUp();
     } else if (g_dstate == PowerDeviceD0) {
-        if (g_active) g_active->PowerDown();
+        for (ULONG i = 0; i < NPATHS; i++) if (g_active[i]) g_active[i]->PowerDown();
         AmpEnable(FALSE);
         g_dspReady = FALSE;
         CoreResetPowerDown(0xF);
@@ -1073,7 +1201,6 @@ static NTSTATUS InstallSubdevice(PDEVICE_OBJECT dev, PIRP irp, PWSTR name, REFGU
 static NTSTATUS StartDevice(PDEVICE_OBJECT dev, PIRP irp, PRESOURCELIST res)
 {
     NTSTATUS st; ULONG i, mem = 0;
-    PUNKNOWN wavePort = NULL, topoPort = NULL;
 
     LogOpen();
     Log("=== jslaudio start ===");
@@ -1091,7 +1218,6 @@ static NTSTATUS StartDevice(PDEVICE_OBJECT dev, PIRP irp, PRESOURCELIST res)
     g_dstate = PowerDeviceD0;
     st = HwStart();
     if (!NT_SUCCESS(st)) return st;
-    g_streamIdx = g_iss + 1;
 
     {
         CAdapterPower *pm = new (POOL_FLAG_NON_PAGED, TAG) CAdapterPower(NULL);
@@ -1102,24 +1228,39 @@ static NTSTATUS StartDevice(PDEVICE_OBJECT dev, PIRP irp, PRESOURCELIST res)
         }
     }
 
-    CMiniportWave *w = new (POOL_FLAG_NON_PAGED, TAG) CMiniportWave(NULL);
-    CMiniportTopo *t = new (POOL_FLAG_NON_PAGED, TAG) CMiniportTopo(NULL);
-    if (!w || !t) { if (w) delete w; if (t) delete t; return STATUS_INSUFFICIENT_RESOURCES; }
-    w->AddRef(); t->AddRef();
-
-    st = InstallSubdevice(dev, irp, (PWSTR)L"Topology", CLSID_PortTopology, PUNKNOWN(PMINIPORTTOPOLOGY(t)), res, &topoPort);
-    if (NT_SUCCESS(st)) st = InstallSubdevice(dev, irp, (PWSTR)L"Wave", CLSID_PortWaveRT, PUNKNOWN(PMINIPORTWAVERT(w)), res, &wavePort);
-    if (NT_SUCCESS(st)) st = PcRegisterPhysicalConnection(dev, wavePort, 1, topoPort, 0);
+    /* one Wave + Topology filter pair per path; names must match the INF (KSNAME_*) */
+    static const struct { ULONG path; PCWSTR wave, topo; } ep[] = {
+        { PATH_SPK,  L"Wave",    L"Topology" },
+        { PATH_DMIC, L"WaveMic", L"TopologyMic" },
+    };
+    for (i = 0; i < ARRAYSIZE(ep); i++) {
+        PUNKNOWN wavePort = NULL, topoPort = NULL;
+        NTSTATUS es;
+        CMiniportWave *w = new (POOL_FLAG_NON_PAGED, TAG) CMiniportWave(NULL);
+        CMiniportTopo *t = new (POOL_FLAG_NON_PAGED, TAG) CMiniportTopo(NULL);
+        if (!w || !t) { if (w) delete w; if (t) delete t; es = STATUS_INSUFFICIENT_RESOURCES; goto done; }
+        w->m_pathIdx = t->m_pathIdx = ep[i].path;
+        w->AddRef(); t->AddRef();
+        es = InstallSubdevice(dev, irp, (PWSTR)ep[i].topo, CLSID_PortTopology, PUNKNOWN(PMINIPORTTOPOLOGY(t)), res, &topoPort);
+        if (NT_SUCCESS(es)) es = InstallSubdevice(dev, irp, (PWSTR)ep[i].wave, CLSID_PortWaveRT, PUNKNOWN(PMINIPORTWAVERT(w)), res, &wavePort);
+        if (NT_SUCCESS(es)) {
+            if (g_paths[ep[i].path].dir == DIR_CAPTURE) es = PcRegisterPhysicalConnection(dev, topoPort, 1, wavePort, 0);
+            else                                        es = PcRegisterPhysicalConnection(dev, wavePort, 1, topoPort, 0);
+        }
+        w->Release(); t->Release();
+        if (wavePort) wavePort->Release();
+        if (topoPort) topoPort->Release();
+    done:
+        Log("endpoint %s -> %08X", g_paths[ep[i].path].name, es);
+        if (i == 0) st = es;                 /* only the speaker endpoint is fatal */
+    }
     Log("StartDevice -> %08X", st);
-    w->Release(); t->Release();
-    if (wavePort) wavePort->Release();
-    if (topoPort) topoPort->Release();
     return st;
 }
 
 static NTSTATUS AddDevice(PDRIVER_OBJECT drv, PDEVICE_OBJECT pdo)
 {
-    return PcAddAdapterDevice(drv, pdo, (PCPFNSTARTDEVICE)StartDevice, 4, 0);
+    return PcAddAdapterDevice(drv, pdo, (PCPFNSTARTDEVICE)StartDevice, 8, 0);
 }
 
 /* hardware teardown after PortCls has stopped/removed the subdevices (streams are torn down by then) */
@@ -1155,6 +1296,7 @@ static NTSTATUS PnpDispatch(PDEVICE_OBJECT dev, PIRP irp)
 extern "C" DRIVER_INITIALIZE DriverEntry;
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
 {
+    RtlStringCbCopyNW(g_regPath, sizeof(g_regPath), reg->Buffer, reg->Length);
     InitFwPath(reg);
     NTSTATUS st = PcInitializeAdapterDriver(drv, reg, (PDRIVER_ADD_DEVICE)AddDevice);
     if (NT_SUCCESS(st)) {
