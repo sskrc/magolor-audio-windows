@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # (Administrator) Remove every jslaudio driver package and restart the audio DSP device.
 # Windows then falls back to whatever other driver matches (e.g. Intel's, if present in the driver store).
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Write-Error "Run this script from an elevated (Administrator) PowerShell."; exit 1 }
 $old = (pnputil /enum-drivers) -join "`n" |
     Select-String -AllMatches -Pattern 'Published Name:\s+(oem\d+\.inf)\s+Original Name:\s+jslaudio\.inf' |
     ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value }

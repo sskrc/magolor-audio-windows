@@ -338,10 +338,11 @@ typedef struct {
     BOOLEAN ready;        /* pipeline built in the current DSP boot */
 } AUDIOPATH;
 
-enum { PATH_SPK = 0, PATH_DMIC = 1, NPATHS };
+enum { PATH_SPK = 0, PATH_DMIC = 1, PATH_HP = 2, NPATHS };
 static AUDIOPATH g_paths[NPATHS] = {
-    { "speaker", DIR_PLAYBACK,  0, DAI_SSP,  1, FRAME_S24_4LE, 2, TRUE  },
-    { "dmic",    DIR_CAPTURE,  10, DAI_DMIC, 0, FRAME_S32_LE,  2, FALSE },
+    { "speaker",   DIR_PLAYBACK,  0, DAI_SSP,  1, FRAME_S24_4LE, 2, TRUE  },
+    { "dmic",      DIR_CAPTURE,  10, DAI_DMIC, 0, FRAME_S32_LE,  2, FALSE },
+    { "headphone", DIR_PLAYBACK, 20, DAI_SSP,  0, FRAME_S24_4LE, 3, FALSE },   /* RT5682 via SSP0 (codec set up by jslcodec) */
 };
 #define HOST_ID(p) ((p)->base + 1)
 #define BUF_ID(p)  ((p)->base + 3)
@@ -442,11 +443,14 @@ static VOID FillDaiConfig(AUDIOPATH *p, IPC_DAI_CONFIG *dc)
     dc->type = p->daiType; dc->dai_index = p->daiIndex;
     dc->flags = 1;                                   /* HW_PARAMS */
     if (p->daiType == DAI_SSP) {
+        /* both SSPs share the single I2S_MCLK pin: 24 MHz as in the topology (RT1015P ignores MCLK) */
         dc->format = 0x0001 | 0x4000;                /* I2S, NB_NF, codec bclk+fsync consumer */
-        dc->ssp.mclk_rate = 19200000; dc->ssp.fsync_rate = 48000; dc->ssp.bclk_rate = 3072000;
+        dc->ssp.mclk_rate = 24000000; dc->ssp.fsync_rate = 48000;
         dc->ssp.tdm_slots = 2; dc->ssp.rx_slots = 3; dc->ssp.tx_slots = 3;
-        dc->ssp.sample_valid_bits = 24; dc->ssp.tdm_slot_width = 32;
-        dc->ssp.clks_control = (1u << 6) | (1u << 7);   /* MCLK/BCLK early start: RT1015P locks before data */
+        dc->ssp.sample_valid_bits = 24;
+        if (p->daiIndex == 0) { dc->ssp.bclk_rate = 2400000; dc->ssp.tdm_slot_width = 25; }   /* RT5682: 50 fs */
+        else                  { dc->ssp.bclk_rate = 3072000; dc->ssp.tdm_slot_width = 32; }   /* RT1015P: 64 fs */
+        dc->ssp.clks_control = (1u << 6) | (1u << 7);   /* MCLK/BCLK early start: codecs lock before data */
     } else {
         dc->format = 6;                              /* SOF_DAI_FMT_PDM */
         dc->dmic.driver_ipc_version = 1;
@@ -734,6 +738,7 @@ static NTSTATUS HwStart(VOID)
 
     g_paths[PATH_SPK].hdaIdx  = g_iss + 1;      /* 2nd output stream (1st is the code loader) */
     g_paths[PATH_DMIC].hdaIdx = 1;              /* 2nd input stream (1st is used by the boot ICCMAX stream) */
+    g_paths[PATH_HP].hdaIdx   = g_iss + 2;      /* 3rd output stream */
     for (t = 0; t < NPATHS; t++) g_paths[t].ready = FALSE;
 
     st = BootDsp();
@@ -804,6 +809,14 @@ static PCPIN_DESCRIPTOR g_topoMicPins[] = {
 };
 static PCFILTER_DESCRIPTOR g_topoMicFilter = {
     0, NULL, sizeof(PCPIN_DESCRIPTOR), 2, g_topoMicPins, sizeof(PCNODE_DESCRIPTOR), 0, NULL, 1, g_topoConn, 0, NULL
+};
+/* headphones: same shape as the speaker topology, endpoint pin category = headphones */
+static PCPIN_DESCRIPTOR g_topoHpPins[] = {
+    { 0, 0, 0, NULL, { 0, NULL, 0, NULL, 1, g_bridgeRanges, KSPIN_DATAFLOW_IN, KSPIN_COMMUNICATION_NONE, &KSCATEGORY_AUDIO, NULL, 0 } },
+    { 0, 0, 0, NULL, { 0, NULL, 0, NULL, 1, g_bridgeRanges, KSPIN_DATAFLOW_OUT, KSPIN_COMMUNICATION_NONE, &KSNODETYPE_HEADPHONES, NULL, 0 } },
+};
+static PCFILTER_DESCRIPTOR g_topoHpFilter = {
+    0, NULL, sizeof(PCPIN_DESCRIPTOR), 2, g_topoHpPins, sizeof(PCNODE_DESCRIPTOR), 0, NULL, 1, g_topoConn, 0, NULL
 };
 #define STREAM_PIN(path) (g_paths[path].dir == DIR_CAPTURE ? 1u : 0u)
 
@@ -1135,7 +1148,7 @@ STDMETHODIMP CMiniportTopo::NonDelegatingQueryInterface(REFIID riid, PVOID *obj)
 STDMETHODIMP_(NTSTATUS) CMiniportTopo::Init(PUNKNOWN, PRESOURCELIST, PPORTTOPOLOGY) { return STATUS_SUCCESS; }
 STDMETHODIMP_(NTSTATUS) CMiniportTopo::GetDescription(PPCFILTER_DESCRIPTOR *d)
 {
-    *d = (g_paths[m_pathIdx].dir == DIR_CAPTURE) ? &g_topoMicFilter : &g_topoFilter;
+    *d = (g_paths[m_pathIdx].dir == DIR_CAPTURE) ? &g_topoMicFilter : (m_pathIdx == PATH_HP) ? &g_topoHpFilter : &g_topoFilter;
     return STATUS_SUCCESS;
 }
 STDMETHODIMP_(NTSTATUS) CMiniportTopo::DataRangeIntersection(ULONG, PKSDATARANGE, PKSDATARANGE, ULONG, PVOID, PULONG) { return STATUS_NOT_IMPLEMENTED; }
@@ -1232,6 +1245,7 @@ static NTSTATUS StartDevice(PDEVICE_OBJECT dev, PIRP irp, PRESOURCELIST res)
     static const struct { ULONG path; PCWSTR wave, topo; } ep[] = {
         { PATH_SPK,  L"Wave",    L"Topology" },
         { PATH_DMIC, L"WaveMic", L"TopologyMic" },
+        { PATH_HP,   L"WaveHP",  L"TopologyHP" },
     };
     for (i = 0; i < ARRAYSIZE(ep); i++) {
         PUNKNOWN wavePort = NULL, topoPort = NULL;

@@ -4,6 +4,7 @@
 #   -LogPath <file>   write the driver log to <file> instead of %SystemRoot%\Temp\jslaudio.log
 #                     (handy because Temp files created by the kernel are not readable without admin)
 param([string]$LogPath)
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Write-Error "Run this script from an elevated (Administrator) PowerShell."; exit 1 }
 $ErrorActionPreference = 'Continue'
 $svc = 'HKLM:\SYSTEM\CurrentControlSet\Services\jslaudio'
 function Set-LogPath { if ($LogPath -and (Test-Path $svc)) { Set-ItemProperty $svc -Name LogPath -Value ('\??\' + [IO.Path]::GetFullPath($LogPath)) } }

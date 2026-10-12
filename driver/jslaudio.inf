@@ -43,6 +43,25 @@ AddInterface=%KSCATEGORY_CAPTURE%,%KSNAME_WaveMic%,Iface.WaveMic
 AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_WaveMic%,Iface.WaveMic
 AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_TopologyMic%,Iface.TopoMic
 AddInterface=%KSCATEGORY_TOPOLOGY%,%KSNAME_TopologyMic%,Iface.TopoMic
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_WaveHP%,Iface.WaveHP
+AddInterface=%KSCATEGORY_RENDER%,%KSNAME_WaveHP%,Iface.WaveHP
+AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_WaveHP%,Iface.WaveHP
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_TopologyHP%,Iface.TopoHP
+AddInterface=%KSCATEGORY_TOPOLOGY%,%KSNAME_TopologyHP%,Iface.TopoHP
+
+[Iface.WaveHP]
+AddReg=Iface.WaveHP.AddReg
+
+[Iface.WaveHP.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%WaveHP.Name%
+
+[Iface.TopoHP]
+AddReg=Iface.TopoHP.AddReg
+
+[Iface.TopoHP.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%TopoHP.Name%
 
 [Iface.WaveMic]
 AddReg=Iface.WaveMic.AddReg
@@ -93,6 +112,10 @@ TopoMic.Name="Microphone Topology"
 KSCATEGORY_CAPTURE="{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
 KSNAME_WaveMic="WaveMic"
 KSNAME_TopologyMic="TopologyMic"
+WaveHP.Name="Headphones"
+TopoHP.Name="Headphones Topology"
+KSNAME_WaveHP="WaveHP"
+KSNAME_TopologyHP="TopologyHP"
 KSCATEGORY_AUDIO="{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
 KSCATEGORY_RENDER="{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
 KSCATEGORY_REALTIME="{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
